@@ -1,14 +1,15 @@
+
+import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
 
 import redis
-import time
-from fastapi import HTTPException
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -17,7 +18,7 @@ from libs.common.correlation import (
     get_correlation_id,
     set_correlation_id,
 )
-from libs.common.metrics import HTTP_REQUESTS, FNOL_REJECTED, RUNS_STARTED
+from libs.common.metrics import FNOL_REJECTED, RUNS_STARTED
 
 from services.api.app.config import settings
 from services.api.app.database import engine, SessionLocal
@@ -27,25 +28,13 @@ from services.api.app.celery_app import celery_app
 from services.intake_agent.tasks import process_claim
 
 
+# --------------------------------------------------
+# APPLICATION INITIALIZATION
+# --------------------------------------------------
+
 configure_logging(settings.log_level)
 logger = get_logger("api")
-def check_rate_limit(client_id: str) -> bool:
-    """Allow a maximum number of FNOL requests per client per minute."""
 
-    client = redis.Redis.from_url(
-        settings.redis_url,
-        decode_responses=True,
-    )
-
-    key = f"rate_limit:{client_id}"
-    current_count = client.incr(key)
-
-    if current_count == 1:
-        client.expire(key, 60)
-
-    client.close()
-
-    return current_count <= settings.rate_limit_per_min
 
 app = FastAPI(
     title=settings.app_name,
@@ -57,6 +46,104 @@ app = FastAPI(
 app.mount("/metrics", make_asgi_app())
 
 
+# --------------------------------------------------
+# REDIS CACHE FUNCTIONS
+# --------------------------------------------------
+
+def generate_cache_key(fnol_data: dict) -> str:
+    """Generate a consistent SHA-256 cache key for an FNOL request."""
+
+    normalized_data = json.dumps(
+        fnol_data,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    cache_input = f"{normalized_data}:prompt-v1:index-v1"
+
+    return hashlib.sha256(
+        cache_input.encode("utf-8")
+    ).hexdigest()
+
+
+def get_cached_result(cache_key: str):
+    """Retrieve a previously completed claim result from Redis."""
+
+    client = redis.Redis.from_url(
+        settings.redis_url,
+        decode_responses=True,
+    )
+
+    try:
+        cached_data = client.get(f"run_cache:{cache_key}")
+
+        if cached_data is None:
+            return None
+
+        return json.loads(cached_data)
+
+    finally:
+        client.close()
+
+
+def save_cached_result(
+    cache_key: str,
+    run_id: str,
+    result: dict,
+):
+    """Save a completed claim result in Redis with an expiry time."""
+
+    client = redis.Redis.from_url(
+        settings.redis_url,
+        decode_responses=True,
+    )
+
+    try:
+        cache_data = {
+            "original_run_id": run_id,
+            "result": result,
+        }
+
+        client.setex(
+            f"run_cache:{cache_key}",
+            settings.run_cache_ttl_s,
+            json.dumps(cache_data),
+        )
+
+    finally:
+        client.close()
+
+
+# --------------------------------------------------
+# RATE LIMITING
+# --------------------------------------------------
+
+def check_rate_limit(client_id: str) -> bool:
+    """Allow a maximum number of FNOL requests per client per minute."""
+
+    client = redis.Redis.from_url(
+        settings.redis_url,
+        decode_responses=True,
+    )
+
+    try:
+        key = f"rate_limit:{client_id}"
+
+        current_count = client.incr(key)
+
+        if current_count == 1:
+            client.expire(key, 60)
+
+        return current_count <= settings.rate_limit_per_min
+
+    finally:
+        client.close()
+
+
+# --------------------------------------------------
+# CORRELATION ID MIDDLEWARE
+# --------------------------------------------------
+
 @app.middleware("http")
 async def correlation_middleware(request: Request, call_next):
     correlation_id = (
@@ -67,17 +154,22 @@ async def correlation_middleware(request: Request, call_next):
     set_correlation_id(correlation_id)
 
     response = await call_next(request)
+
     response.headers["X-Correlation-ID"] = correlation_id
 
     return response
 
+
+# --------------------------------------------------
+# INVALID REQUEST QUARANTINE
+# --------------------------------------------------
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(
     request: Request,
     exc: RequestValidationError,
 ):
-    """Save invalid FNOL requests in quarantine without creating a run."""
+    """Save invalid requests in quarantine without creating a run."""
 
     raw_request = await request.body()
 
@@ -85,7 +177,9 @@ async def validation_exception_handler(
 
     errors = [
         {
-            "field": ".".join(str(part) for part in error["loc"]),
+            "field": ".".join(
+                str(part) for part in error["loc"]
+            ),
             "message": error["msg"],
             "type": error["type"],
         }
@@ -121,6 +215,10 @@ async def validation_exception_handler(
     )
 
 
+# --------------------------------------------------
+# ROOT ENDPOINT
+# --------------------------------------------------
+
 @app.get("/")
 def root():
     return {
@@ -130,14 +228,20 @@ def root():
     }
 
 
+# --------------------------------------------------
+# APPLICATION HEALTH
+# --------------------------------------------------
+
 @app.get("/health")
 def health_check():
+
     database_status = "healthy"
     redis_status = "healthy"
 
     try:
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
+
     except SQLAlchemyError:
         database_status = "unhealthy"
 
@@ -146,8 +250,10 @@ def health_check():
             settings.redis_url,
             socket_connect_timeout=2,
         )
+
         client.ping()
         client.close()
+
     except redis.RedisError:
         redis_status = "unhealthy"
 
@@ -169,18 +275,57 @@ def health_check():
     }
 
 
+# --------------------------------------------------
+# FNOL SUBMISSION
+# --------------------------------------------------
+
 @app.post("/v1/fnol", status_code=202)
 def submit_fnol(request: Request, fnol: FNOLRequest):
     """Validate and submit a claim for background processing."""
-    client_id = request.client.host if request.client else "unknown"
 
+    # Convert the validated FNOL request into JSON-compatible data.
+    fnol_data = fnol.model_dump(mode="json")
+
+    # Identify the client submitting the claim.
+    client_id = (
+        request.client.host
+        if request.client
+        else "unknown"
+    )
+
+    # Step 1: Apply rate limiting.
     if not check_rate_limit(client_id):
+
         FNOL_REJECTED.labels(reason="rate_limit").inc()
+
         raise HTTPException(
             status_code=429,
-            detail="Rate limit exceeded. Maximum 30 FNOL submissions per minute.",
+            detail=(
+                "Rate limit exceeded. "
+                "Maximum 30 FNOL submissions per minute."
+            ),
             headers={"Retry-After": "10"},
         )
+
+    # Step 2: Generate a cache key.
+    cache_key = generate_cache_key(fnol_data)
+
+    # Step 3: Check Redis for an existing completed result.
+    cached_result = get_cached_result(cache_key)
+
+    if cached_result is not None:
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "completed",
+                "cached": True,
+                "original_run_id": cached_result["original_run_id"],
+                "result": cached_result["result"],
+            },
+        )
+
+    # Step 4: No cache hit. Create a new claim run.
     db = SessionLocal()
 
     try:
@@ -190,13 +335,13 @@ def submit_fnol(request: Request, fnol: FNOLRequest):
             run_id=run_id,
             status="queued",
             correlation_id=get_correlation_id(),
-            fnol_data=fnol.model_dump(mode="json"),
+            fnol_data=fnol_data,
         )
 
         db.add(run)
         db.commit()
 
-        # Send the claim to the Celery intake queue.
+        # Step 5: Send the claim to the Celery intake queue.
         process_claim.delay(str(run_id))
 
         RUNS_STARTED.inc()
@@ -220,6 +365,10 @@ def submit_fnol(request: Request, fnol: FNOLRequest):
         db.close()
 
 
+# --------------------------------------------------
+# CLAIM STATUS
+# --------------------------------------------------
+
 @app.get("/v1/runs/{run_id}")
 def get_run(run_id: uuid.UUID):
     """Retrieve the current status and result of a claim."""
@@ -242,21 +391,28 @@ def get_run(run_id: uuid.UUID):
             "error": run.error,
             "created_at": (
                 run.created_at.isoformat()
-                if run.created_at else None
+                if run.created_at
+                else None
             ),
             "started_at": (
                 run.started_at.isoformat()
-                if run.started_at else None
+                if run.started_at
+                else None
             ),
             "completed_at": (
                 run.completed_at.isoformat()
-                if run.completed_at else None
+                if run.completed_at
+                else None
             ),
         }
 
     finally:
         db.close()
 
+
+# --------------------------------------------------
+# CLAIM PROCESSING TRACE
+# --------------------------------------------------
 
 @app.get("/v1/runs/{run_id}/trace")
 def get_run_trace(run_id: uuid.UUID):
@@ -275,9 +431,14 @@ def get_run_trace(run_id: uuid.UUID):
 
         rows = db.execute(
             text("""
-                SELECT seq, step_name, status,
-                       input_data, output_data,
-                       started_at, completed_at
+                SELECT
+                    seq,
+                    step_name,
+                    status,
+                    input_data,
+                    output_data,
+                    started_at,
+                    completed_at
                 FROM run_steps
                 WHERE run_id = :run_id
                 ORDER BY seq
@@ -292,11 +453,13 @@ def get_run_trace(run_id: uuid.UUID):
                     **dict(row),
                     "started_at": (
                         row["started_at"].isoformat()
-                        if row["started_at"] else None
+                        if row["started_at"]
+                        else None
                     ),
                     "completed_at": (
                         row["completed_at"].isoformat()
-                        if row["completed_at"] else None
+                        if row["completed_at"]
+                        else None
                     ),
                 }
                 for row in rows
@@ -307,12 +470,17 @@ def get_run_trace(run_id: uuid.UUID):
         db.close()
 
 
+# --------------------------------------------------
+# CELERY WORKER HEALTH
+# --------------------------------------------------
+
 @app.get("/health/worker")
 def worker_health():
     """Check whether Celery workers are responding."""
 
     try:
         inspector = celery_app.control.inspect(timeout=2)
+
         workers = inspector.ping() or {}
 
         return {
@@ -327,18 +495,25 @@ def worker_health():
         }
 
 
-logger.info("api_application_initialized")
-from pydantic import BaseModel, Field
-
+# --------------------------------------------------
+# FEEDBACK CONTRACT
+# --------------------------------------------------
 
 class FeedbackRequest(BaseModel):
     """User feedback about a processed claim."""
 
     rating: int = Field(ge=1, le=5)
+
     comments: str | None = Field(
         default=None,
         max_length=2000,
     )
+
+
+# --------------------------------------------------
+# FEEDBACK SUMMARY
+# --------------------------------------------------
+
 @app.get("/v1/feedback/summary")
 def get_feedback_summary():
     """Return overall user feedback statistics."""
@@ -357,7 +532,9 @@ def get_feedback_summary():
 
         ratings = db.execute(
             text("""
-                SELECT rating, COUNT(*) AS count
+                SELECT
+                    rating,
+                    COUNT(*) AS count
                 FROM feedback
                 GROUP BY rating
                 ORDER BY rating
@@ -367,7 +544,10 @@ def get_feedback_summary():
         return {
             "total_feedback": summary["total_feedback"],
             "average_rating": (
-                round(float(summary["average_rating"]), 2)
+                round(
+                    float(summary["average_rating"]),
+                    2,
+                )
                 if summary["average_rating"] is not None
                 else None
             ),
@@ -382,8 +562,17 @@ def get_feedback_summary():
 
     finally:
         db.close()
+
+
+# --------------------------------------------------
+# SUBMIT FEEDBACK
+# --------------------------------------------------
+
 @app.post("/v1/runs/{run_id}/feedback")
-def submit_feedback(run_id: uuid.UUID, feedback: FeedbackRequest):
+def submit_feedback(
+    run_id: uuid.UUID,
+    feedback: FeedbackRequest,
+):
     """Save user feedback for a claim."""
 
     db = SessionLocal()
@@ -416,3 +605,10 @@ def submit_feedback(run_id: uuid.UUID, feedback: FeedbackRequest):
 
     finally:
         db.close()
+
+
+# --------------------------------------------------
+# APPLICATION STARTUP LOG
+# --------------------------------------------------
+
+logger.info("api_application_initialized")

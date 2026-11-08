@@ -1,12 +1,47 @@
 import time
 import uuid
+import hashlib
+import json
+import redis
 from datetime import datetime, timezone
 
 from services.api.app.celery_app import celery_app
 from services.api.app.database import SessionLocal
+from services.api.app.config import settings
 from services.api.app.models import Run, RunStep
 
+def save_claim_cache(fnol_data: dict, run_id: str, result: dict):
+    """Save a successfully processed claim result in Redis."""
 
+    normalized_data = json.dumps(
+        fnol_data,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    cache_input = f"{normalized_data}:prompt-v1:index-v1"
+    cache_key = hashlib.sha256(
+        cache_input.encode("utf-8")
+    ).hexdigest()
+
+    client = redis.Redis.from_url(
+        settings.redis_url,
+        decode_responses=True,
+    )
+
+    try:
+        cache_data = {
+            "original_run_id": run_id,
+            "result": result,
+        }
+
+        client.setex(
+            f"run_cache:{cache_key}",
+            settings.run_cache_ttl_s,
+            json.dumps(cache_data),
+        )
+    finally:
+        client.close()
 @celery_app.task(name="intake.process_claim")
 def process_claim(run_id: str):
     """Temporary worker that simulates claim processing."""
@@ -70,14 +105,16 @@ def process_claim(run_id: str):
 
         run.status = "completed"
         run.completed_at = datetime.now(timezone.utc)
-
         db.commit()
 
-        return {
-            "run_id": run_id,
-            "status": "completed",
-        }
+        if run.status in ("completed", "escalated"):
+            save_claim_cache(
+                run.fnol_data,
+                str(run_id),
+                run.result,
+            )
 
+        return {"run_id": run_id, "status": "completed"}
     except Exception:
         db.rollback()
 
