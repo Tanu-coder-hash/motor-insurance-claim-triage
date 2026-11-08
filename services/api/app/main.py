@@ -3,6 +3,8 @@ import uuid
 from datetime import datetime, timezone
 
 import redis
+import time
+from fastapi import HTTPException
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -27,6 +29,23 @@ from services.intake_agent.tasks import process_claim
 
 configure_logging(settings.log_level)
 logger = get_logger("api")
+def check_rate_limit(client_id: str) -> bool:
+    """Allow a maximum number of FNOL requests per client per minute."""
+
+    client = redis.Redis.from_url(
+        settings.redis_url,
+        decode_responses=True,
+    )
+
+    key = f"rate_limit:{client_id}"
+    current_count = client.incr(key)
+
+    if current_count == 1:
+        client.expire(key, 60)
+
+    client.close()
+
+    return current_count <= settings.rate_limit_per_min
 
 app = FastAPI(
     title=settings.app_name,
@@ -151,9 +170,17 @@ def health_check():
 
 
 @app.post("/v1/fnol", status_code=202)
-def submit_fnol(fnol: FNOLRequest):
+def submit_fnol(request: Request, fnol: FNOLRequest):
     """Validate and submit a claim for background processing."""
+    client_id = request.client.host if request.client else "unknown"
 
+    if not check_rate_limit(client_id):
+        FNOL_REJECTED.labels(reason="rate_limit").inc()
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Maximum 30 FNOL submissions per minute.",
+            headers={"Retry-After": "10"},
+        )
     db = SessionLocal()
 
     try:
