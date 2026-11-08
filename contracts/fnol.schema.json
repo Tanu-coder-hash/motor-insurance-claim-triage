@@ -1,0 +1,139 @@
+{
+  "$defs": {
+    "Channel": {
+      "enum": [
+        "app",
+        "web",
+        "call_centre"
+      ],
+      "title": "Channel",
+      "type": "string"
+    },
+    "VehicleClass": {
+      "enum": [
+        "private_car",
+        "two_wheeler",
+        "commercial"
+      ],
+      "title": "VehicleClass",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Validated First Notice of Loss submission.",
+  "properties": {
+    "policy_number": {
+      "maxLength": 30,
+      "minLength": 8,
+      "title": "Policy Number",
+      "type": "string"
+    },
+    "policy_start": {
+      "format": "date",
+      "title": "Policy Start",
+      "type": "string"
+    },
+    "policy_end": {
+      "format": "date",
+      "title": "Policy End",
+      "type": "string"
+    },
+    "date_of_loss": {
+      "format": "date",
+      "title": "Date Of Loss",
+      "type": "string"
+    },
+    "date_reported": {
+      "format": "date",
+      "title": "Date Reported",
+      "type": "string"
+    },
+    "vehicle_registration": {
+      "title": "Vehicle Registration",
+      "type": "string"
+    },
+    "vehicle_class": {
+      "$ref": "#/$defs/VehicleClass"
+    },
+    "channel": {
+      "$ref": "#/$defs/Channel"
+    },
+    "estimated_loss_inr": {
+      "maximum": 5000000,
+      "minimum": 0,
+      "title": "Estimated Loss Inr",
+      "type": "number"
+    },
+    "injuries_reported": {
+      "title": "Injuries Reported",
+      "type": "boolean"
+    },
+    "third_party_involved": {
+      "title": "Third Party Involved",
+      "type": "boolean"
+    },
+    "third_party_details": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Third Party Details"
+    },
+    "theft_reported": {
+      "title": "Theft Reported",
+      "type": "boolean"
+    },
+    "fir_number": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Fir Number"
+    },
+    "cashless_garage": {
+      "title": "Cashless Garage",
+      "type": "boolean"
+    },
+    "location": {
+      "maxLength": 200,
+      "minLength": 3,
+      "title": "Location",
+      "type": "string"
+    },
+    "description": {
+      "maxLength": 5000,
+      "minLength": 20,
+      "title": "Description",
+      "type": "string"
+    }
+  },
+  "required": [
+    "policy_number",
+    "policy_start",
+    "policy_end",
+    "date_of_loss",
+    "date_reported",
+    "vehicle_registration",
+    "vehicle_class",
+    "channel",
+    "estimated_loss_inr",
+    "injuries_reported",
+    "third_party_involved",
+    "theft_reported",
+    "cashless_garage",
+    "location",
+    "description"
+  ],
+  "title": "FNOLRequest",
+  "type": "object"
+}
