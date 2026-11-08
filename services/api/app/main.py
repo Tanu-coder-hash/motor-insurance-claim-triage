@@ -20,7 +20,7 @@ from libs.common.metrics import HTTP_REQUESTS, FNOL_REJECTED, RUNS_STARTED
 from services.api.app.config import settings
 from services.api.app.database import engine, SessionLocal
 from services.api.app.contracts import FNOLRequest
-from services.api.app.models import Run, Quarantine
+from services.api.app.models import Run, Quarantine, Feedback
 from services.api.app.celery_app import celery_app
 from services.intake_agent.tasks import process_claim
 
@@ -301,3 +301,91 @@ def worker_health():
 
 
 logger.info("api_application_initialized")
+from pydantic import BaseModel, Field
+
+
+class FeedbackRequest(BaseModel):
+    """User feedback about a processed claim."""
+
+    rating: int = Field(ge=1, le=5)
+    comments: str | None = Field(
+        default=None,
+        max_length=2000,
+    )
+@app.get("/v1/feedback/summary")
+def get_feedback_summary():
+    """Return overall user feedback statistics."""
+
+    db = SessionLocal()
+
+    try:
+        summary = db.execute(
+            text("""
+                SELECT
+                    COUNT(*) AS total_feedback,
+                    AVG(rating) AS average_rating
+                FROM feedback
+            """)
+        ).mappings().one()
+
+        ratings = db.execute(
+            text("""
+                SELECT rating, COUNT(*) AS count
+                FROM feedback
+                GROUP BY rating
+                ORDER BY rating
+            """)
+        ).mappings().all()
+
+        return {
+            "total_feedback": summary["total_feedback"],
+            "average_rating": (
+                round(float(summary["average_rating"]), 2)
+                if summary["average_rating"] is not None
+                else None
+            ),
+            "ratings": [
+                {
+                    "rating": row["rating"],
+                    "count": row["count"],
+                }
+                for row in ratings
+            ],
+        }
+
+    finally:
+        db.close()
+@app.post("/v1/runs/{run_id}/feedback")
+def submit_feedback(run_id: uuid.UUID, feedback: FeedbackRequest):
+    """Save user feedback for a claim."""
+
+    db = SessionLocal()
+
+    try:
+        run = db.get(Run, run_id)
+
+        if run is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Claim run not found"},
+            )
+
+        new_feedback = Feedback(
+            feedback_id=uuid.uuid4(),
+            run_id=run_id,
+            rating=feedback.rating,
+            comments=feedback.comments,
+        )
+
+        db.add(new_feedback)
+        db.commit()
+
+        return {
+            "message": "Feedback submitted successfully",
+            "feedback_id": str(new_feedback.feedback_id),
+            "run_id": str(run_id),
+            "rating": feedback.rating,
+        }
+
+    finally:
+        db.close()
